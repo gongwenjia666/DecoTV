@@ -3,7 +3,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { AdminConfigResult } from '@/lib/admin.types';
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { verifyApiAuth } from '@/lib/auth';
 import { getConfig, getLocalModeConfig } from '@/lib/config';
 
 export const runtime = 'nodejs';
@@ -14,22 +14,17 @@ interface AdminConfigResultWithMode extends AdminConfigResult {
 }
 
 export async function GET(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
 
-  // 本地存储模式：返回降级配置而非错误
-  if (storageType === 'localstorage') {
-    // 仍需验证身份（本地模式下使用环境变量中的用户名）
-    const authInfo = getAuthInfoFromCookie(request);
-    if (!authInfo || !authInfo.username) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-
-    // 返回本地模式配置，附带 storageMode 标识
+  // 本地存储模式（无数据库）：免登录访问
+  // 这解决了"鸡生蛋"问题：用户需要先进入面板配置系统
+  if (authResult.isLocalMode) {
     const localConfig = getLocalModeConfig();
     const result: AdminConfigResultWithMode = {
-      Role: authInfo.username === process.env.USERNAME ? 'owner' : 'admin',
+      Role: 'owner', // 本地模式下默认 owner
       Config: localConfig,
-      storageMode: 'local', // 告诉前端当前是本地模式
+      storageMode: 'local', // 告诉前端当前是本地模式（无数据库）
     };
 
     return NextResponse.json(result, {
@@ -39,11 +34,16 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
+  // 认证失败
+  if (!authResult.isValid) {
+    console.log('[admin/config] 认证失败:', {
+      hasAuth: !!request.cookies.get('auth'),
+      isLocalMode: authResult.isLocalMode,
+    });
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
-  const username = authInfo.username;
+
+  const username = authResult.username;
 
   try {
     const config = await getConfig();

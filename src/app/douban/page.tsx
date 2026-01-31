@@ -4,6 +4,7 @@
 
 import { useSearchParams } from 'next/navigation';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 
 import { GetBangumiCalendarData } from '@/lib/bangumi.client';
 import {
@@ -12,6 +13,7 @@ import {
   getDoubanRecommends,
 } from '@/lib/douban.client';
 import { DoubanItem, DoubanResult } from '@/lib/types';
+import { generateCacheKey } from '@/lib/unified-cache';
 import { useSourceFilter } from '@/hooks/useSourceFilter';
 
 import DoubanCardSkeleton from '@/components/DoubanCardSkeleton';
@@ -19,6 +21,8 @@ import DoubanCustomSelector from '@/components/DoubanCustomSelector';
 import DoubanSelector, { SourceCategory } from '@/components/DoubanSelector';
 import PageLayout from '@/components/PageLayout';
 import VideoCard from '@/components/VideoCard';
+
+import { useGlobalCache } from '@/contexts/GlobalCacheContext';
 
 function DoubanPageClient() {
   const searchParams = useSearchParams();
@@ -32,6 +36,16 @@ function DoubanPageClient() {
   const loadingRef = useRef<HTMLDivElement>(null);
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  const type = searchParams.get('type') || 'movie';
+
+  // === 智能防抖追踪（必须在 type 定义之后）===
+  const isFirstMount = useRef(true);
+  const prevTypeRef = useRef(type);
+
+  // === 请求生命周期管理：防止并发和重复加载 ===
+  const pendingCacheKeyRef = useRef<string | null>(null); // 当前正在加载的 cacheKey
+  const abortControllerRef = useRef<AbortController | null>(null); // 用于取消前一个请求
+
   // 用于存储最新参数值的 refs
   const currentParamsRef = useRef({
     type: '',
@@ -42,7 +56,13 @@ function DoubanPageClient() {
     currentPage: 0,
   });
 
-  const type = searchParams.get('type') || 'movie';
+  // === 接入全局缓存 ===
+  const {
+    getDoubanData,
+    setDoubanData: setGlobalDoubanData,
+    isDoubanLoading,
+    setDoubanLoading,
+  } = useGlobalCache();
 
   // 获取 runtimeConfig 中的自定义分类数据
   const [customCategories, setCustomCategories] = useState<
@@ -87,6 +107,11 @@ function DoubanPageClient() {
     setCurrentSource,
     getFilteredCategories,
   } = useSourceFilter();
+
+  // 【核心修复】存储当前源的过滤后分类列表（用于渲染）
+  const [filteredSourceCategories, setFilteredSourceCategories] = useState<
+    SourceCategory[]
+  >([]);
 
   // 选中的源分类
   const [selectedSourceCategory, setSelectedSourceCategory] =
@@ -264,9 +289,43 @@ function DoubanPageClient() {
     [type, primarySelection, secondarySelection],
   );
 
-  // 防抖的数据加载函数
+  // 防抖的数据加载函数 - 缓存优先 + 请求生命周期管理
   const loadInitialData = useCallback(async () => {
     // 创建当前参数的快照
+    // 【关键修复】检查选择器状态是否与 type 同步
+    // 防止状态不同步时发起错误的请求（这是导致卡顿的根本原因）
+    const isStateInSync = (() => {
+      if (type === 'movie') {
+        return primarySelection === '热门' || primarySelection === '全部';
+      }
+      if (type === 'tv') {
+        return (
+          (primarySelection === '最近热门' || primarySelection === '全部') &&
+          (secondarySelection === 'tv' || secondarySelection === 'all')
+        );
+      }
+      if (type === 'show') {
+        return (
+          (primarySelection === '最近热门' || primarySelection === '全部') &&
+          (secondarySelection === 'show' || secondarySelection === 'all')
+        );
+      }
+      if (type === 'anime') {
+        return ['每日放送', '番剧', '剧场版', '全部'].includes(
+          primarySelection,
+        );
+      }
+      if (type === 'custom') {
+        return true; // 自定义分类不做检查
+      }
+      return true;
+    })();
+
+    if (!isStateInSync) {
+      // 状态还没同步，跳过这次加载，等待下一次 useEffect 触发
+      return;
+    }
+
     const requestSnapshot = {
       type,
       primarySelection,
@@ -276,8 +335,48 @@ function DoubanPageClient() {
       currentPage: 0,
     };
 
+    // 【缓存优先】生成缓存键
+    const cacheKey = generateCacheKey('douban', {
+      type,
+      primary: primarySelection,
+      secondary: secondarySelection,
+      weekday: type === 'anime' ? selectedWeekday : '',
+      ...multiLevelValues,
+    });
+
+    // 【请求生命周期】如果有新的请求，取消前一个
+    if (pendingCacheKeyRef.current && pendingCacheKeyRef.current !== cacheKey) {
+      abortControllerRef.current?.abort();
+    }
+
+    // 【防止同一 cacheKey 的并发】避免对同一数据发起多个请求
+    if (pendingCacheKeyRef.current === cacheKey) {
+      return;
+    }
+
+    // 【缓存优先】尝试从全局内存缓存读取
+    const cachedData = getDoubanData(cacheKey);
+    if (cachedData && cachedData.length > 0) {
+      // 缓存命中：使用 flushSync 强制同步更新 DOM，实现毫秒级渲染
+      pendingCacheKeyRef.current = null; // 清除待处理标记
+      flushSync(() => {
+        setDoubanData(cachedData);
+        setLoading(false);
+        setHasMore(cachedData.length >= 25);
+        setCurrentPage(0);
+      });
+      return;
+    }
+
+    // 【无缓存】标记为正在加载，记录当前 cacheKey
+    pendingCacheKeyRef.current = cacheKey;
+    // 创建新的 AbortController 用于取消请求
+    abortControllerRef.current = new AbortController();
+
+    setDoubanLoading(cacheKey, true);
+    setLoading(true);
+
     try {
-      setLoading(true);
       // 确保在加载初始数据时重置页面状态
       setDoubanData([]);
       setCurrentPage(0);
@@ -381,11 +480,17 @@ function DoubanPageClient() {
         const currentSnapshot = { ...currentParamsRef.current };
 
         if (isSnapshotEqual(requestSnapshot, currentSnapshot)) {
-          setDoubanData(data.list);
-          setHasMore(data.list.length !== 0);
-          setLoading(false);
-        } else {
-          console.log('参数不一致，不执行任何操作，避免设置过期数据');
+          // 使用 flushSync 确保状态同步更新，避免批处理延迟
+          flushSync(() => {
+            setDoubanData(data.list);
+            setHasMore(data.list.length !== 0);
+            setLoading(false);
+          });
+
+          // 【全局缓存写入】保存到全局 Context 缓存，下次瞬间加载
+          if (data.list.length > 0) {
+            setGlobalDoubanData(cacheKey, data.list);
+          }
         }
         // 如果参数不一致，不执行任何操作，避免设置过期数据
       } else {
@@ -394,6 +499,13 @@ function DoubanPageClient() {
     } catch (err) {
       console.error(err);
       setLoading(false); // 发生错误时总是停止loading状态
+    } finally {
+      // 【请求生命周期】清除待处理标记
+      if (pendingCacheKeyRef.current === cacheKey) {
+        pendingCacheKeyRef.current = null;
+      }
+      // 清除加载状态
+      setDoubanLoading(cacheKey, false);
     }
   }, [
     type,
@@ -403,9 +515,13 @@ function DoubanPageClient() {
     selectedWeekday,
     getRequestParams,
     customCategories,
+    getDoubanData,
+    setGlobalDoubanData,
+    isDoubanLoading,
+    setDoubanLoading,
   ]);
 
-  // 只在选择器准备好后才加载数据
+  // 只在选择器准备好后才加载数据 - 智能防抖
   useEffect(() => {
     // 只有在选择器准备好时才开始加载
     if (!selectorsReady) {
@@ -424,10 +540,25 @@ function DoubanPageClient() {
       clearTimeout(debounceTimeoutRef.current);
     }
 
-    // 使用防抖机制加载数据，避免连续状态更新触发多次请求
-    debounceTimeoutRef.current = setTimeout(() => {
+    // 【智能防抖】判断是否需要立即执行
+    const typeChanged = prevTypeRef.current !== type;
+    const shouldExecuteImmediately = isFirstMount.current || typeChanged;
+
+    // 更新追踪状态
+    prevTypeRef.current = type;
+    if (isFirstMount.current) {
+      isFirstMount.current = false;
+    }
+
+    if (shouldExecuteImmediately) {
+      // 首次挂载或 Tab 切换：立即执行，利用缓存实现 0 延迟
       loadInitialData();
-    }, 100); // 100ms 防抖延迟
+    } else {
+      // 筛选条件变化：使用防抖，防止用户快速点击
+      debounceTimeoutRef.current = setTimeout(() => {
+        loadInitialData();
+      }, 100);
+    }
 
     // 清理函数
     return () => {
@@ -724,14 +855,21 @@ function DoubanPageClient() {
       setIsLoadingSourceData(true);
       try {
         // 构建视频列表 API URL
-        const apiUrl = source.api.endsWith('/')
+        const originalApiUrl = source.api.endsWith('/')
           ? `${source.api}?ac=videolist&t=${category.type_id}&pg=1`
           : `${source.api}/?ac=videolist&t=${category.type_id}&pg=1`;
 
-        const response = await fetch(apiUrl, {
+        // 🛡️ 全量代理：所有外部 URL 都走服务端代理（解决 Mixed Content + CORS）
+        const isExternalUrl =
+          originalApiUrl.startsWith('http://') ||
+          originalApiUrl.startsWith('https://');
+        const proxyUrl = `/api/proxy/cms?url=${encodeURIComponent(originalApiUrl)}`;
+        const fetchUrl = isExternalUrl ? proxyUrl : originalApiUrl;
+
+        console.log('🔥 [fetchSourceCategoryData] Fetching:', fetchUrl);
+
+        const response = await fetch(fetchUrl, {
           headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             Accept: 'application/json',
           },
         });
@@ -742,6 +880,7 @@ function DoubanPageClient() {
 
         const data = await response.json();
         const items = data.list || [];
+        console.log('✅ [fetchSourceCategoryData] Got', items.length, 'items');
 
         // 转换为 DoubanItem 格式
         const convertedItems: DoubanItem[] = items.map((item: any) => ({
@@ -779,6 +918,7 @@ function DoubanPageClient() {
       setHasMore(true);
       setIsLoadingMore(false);
       setSelectedSourceCategory(null); // 清除旧分类ID，防止污染
+      setFilteredSourceCategories([]); // 清空过滤后分类列表
       setIsLoadingSourceData(false);
 
       // === Step 2: 切换源状态 ===
@@ -815,88 +955,99 @@ function DoubanPageClient() {
         // Step 4: 等待分类列表加载完成
         const source = sources.find((s) => s.key === sourceKey);
         if (!source) {
+          console.error('🔥 [Debug] Source not found:', sourceKey);
           setLoading(false);
           return;
         }
 
+        console.log('🔥 [Debug] Selected Source:', source.name, source.api);
+
         try {
           // 构建分类 API URL
-          const apiUrl = source.api.endsWith('/')
+          const originalApiUrl = source.api.endsWith('/')
             ? `${source.api}?ac=class`
             : `${source.api}/?ac=class`;
 
-          const response = await fetch(apiUrl, {
+          console.log('🔥 [Debug] Original API URL:', originalApiUrl);
+
+          // ========================================
+          // 🛡️ 全量代理：所有外部 URL 都走服务端代理
+          // 不仅解决 Mixed Content (HTTP)，也解决 CORS (HTTPS)
+          // ========================================
+          const isExternalUrl =
+            originalApiUrl.startsWith('http://') ||
+            originalApiUrl.startsWith('https://');
+          const proxyUrl = `/api/proxy/cms?url=${encodeURIComponent(originalApiUrl)}`;
+          const fetchUrl = isExternalUrl ? proxyUrl : originalApiUrl;
+
+          console.log('🔥 [Debug] Using proxy:', isExternalUrl);
+          console.log('🔥 [Debug] Fetch URL:', fetchUrl);
+
+          const response = await fetch(fetchUrl, {
             headers: {
-              'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               Accept: 'application/json',
             },
           });
 
-          if (!response.ok) throw new Error('获取分类列表失败');
+          console.log(
+            '🔥 [Debug] Response status:',
+            response.status,
+            response.ok,
+          );
+
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => '');
+            console.error('🔥 [Debug] Response error:', errorText);
+            throw new Error(`获取分类列表失败: ${response.status}`);
+          }
 
           const data = await response.json();
+          console.log('🔥 [Debug] Raw API Response:', data);
+          console.log('✅ [Proxy Fetch Success] Data keys:', Object.keys(data));
+
           const allCategories: SourceCategory[] = data.class || [];
+          console.log(
+            '🔥 [Debug] Parsed categories count:',
+            allCategories.length,
+          );
+          console.log(
+            '🔥 [Debug] First 5 categories:',
+            allCategories.slice(0, 5),
+          );
 
-          // === Step 5: 智能分类过滤与兜底逻辑 ===
-          // 内容类型关键词映射
-          const CONTENT_TYPE_KEYWORDS: Record<string, string[]> = {
-            movie: ['电影', '影片', '大片', '院线', '4K', '蓝光', '片'],
-            tv: [
-              '电视剧',
-              '剧集',
-              '连续剧',
-              '国产剧',
-              '美剧',
-              '韩剧',
-              '日剧',
-              '港剧',
-              '剧',
-            ],
-            anime: ['动漫', '动画', '番剧', '动画片', '卡通', '漫画'],
-            show: ['综艺', '真人秀', '脱口秀', '晚会', '纪录片'],
-          };
+          // ========================================
+          // 🚀 绝对直通模式 - 移除所有过滤逻辑
+          // 直接使用 API 返回的原始分类，不做任何过滤
+          // ========================================
 
-          const keywords = CONTENT_TYPE_KEYWORDS[type] || [];
-
-          // 尝试根据当前频道类型过滤分类
-          let filteredCategories = allCategories.filter((cat) => {
-            const name = cat.type_name.toLowerCase();
-            return keywords.some((keyword) =>
-              name.includes(keyword.toLowerCase()),
-            );
-          });
-
-          // 【关键兜底】如果过滤结果为空，使用降级策略
-          if (filteredCategories.length === 0) {
-            // 降级策略 1: 尝试匹配包含"片"或"剧"的分类
-            filteredCategories = allCategories.filter((cat) => {
-              const name = cat.type_name;
-              return (
-                name.includes('片') ||
-                name.includes('剧') ||
-                name.includes('漫')
-              );
-            });
-          }
-
-          // 降级策略 2: 如果仍为空，显示前 15 个分类
-          if (filteredCategories.length === 0) {
-            filteredCategories = allCategories.slice(0, 15);
-          }
-
-          // Step 6: 【强制自动选中】选中过滤后列表的第一个分类
-          if (filteredCategories.length > 0) {
-            const firstCategory = filteredCategories[0];
-            setSelectedSourceCategory(firstCategory);
-            // Step 7: 触发数据加载
-            fetchSourceCategoryData(firstCategory);
-          } else {
-            // 没有分类时停止 loading
+          if (allCategories.length === 0) {
+            console.warn('🔥 [Debug] API returned empty categories!');
+            // 提示用户：源没有返回分类数据
+            setFilteredSourceCategories([]);
             setLoading(false);
+            return;
           }
+
+          // 【绝对直通】直接使用原始分类，不过滤
+          console.log(
+            '🔥 [Debug] Setting categories (NO FILTER):',
+            allCategories.length,
+          );
+          setFilteredSourceCategories(allCategories);
+
+          // 【强制自动选中】立即选中第一个分类
+          const firstCategory = allCategories[0];
+          console.log(
+            '🔥 [Debug] Auto-selecting first category:',
+            firstCategory,
+          );
+          setSelectedSourceCategory(firstCategory);
+
+          // 立即触发数据加载（不等待用户点击）
+          fetchSourceCategoryData(firstCategory);
         } catch (err) {
-          console.error('获取源分类失败:', err);
+          console.error('🔥 [Debug] Fetch error:', err);
+          setFilteredSourceCategories([]); // 出错时清空
           setLoading(false);
         }
       }
@@ -979,9 +1130,15 @@ function DoubanPageClient() {
                 // 数据源相关 props
                 sources={sources}
                 currentSource={currentSource}
-                sourceCategories={getFilteredCategories(
-                  type as 'movie' | 'tv' | 'anime' | 'show',
-                )}
+                // 【核心修复】使用 filteredSourceCategories state 而非 getFilteredCategories
+                // 这样确保渲染的分类与 handleSourceChange 处理的分类一致
+                sourceCategories={
+                  currentSource !== 'auto'
+                    ? filteredSourceCategories
+                    : getFilteredCategories(
+                        type as 'movie' | 'tv' | 'anime' | 'show',
+                      )
+                }
                 isLoadingSources={isLoadingSources}
                 isLoadingCategories={isLoadingCategories}
                 onSourceChange={handleSourceChange}
@@ -1004,8 +1161,14 @@ function DoubanPageClient() {
 
         {/* 内容展示区域 */}
         <div className='max-w-[95%] mx-auto mt-8 overflow-visible'>
-          {/* 内容网格 */}
-          <div className='justify-start grid grid-cols-3 gap-x-2 gap-y-12 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,minmax(160px,1fr))] sm:gap-x-8 sm:gap-y-20'>
+          {/* 内容网格 - 使用 content-visibility 优化渲染性能 */}
+          <div
+            className='justify-start grid grid-cols-3 gap-x-2 gap-y-12 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,minmax(160px,1fr))] sm:gap-x-8 sm:gap-y-20'
+            style={{
+              contentVisibility: 'auto',
+              containIntrinsicSize: '0 500px',
+            }}
+          >
             {loading || isLoadingSourceData || !selectorsReady ? (
               // 显示骨架屏
               skeletonData.map((index) => <DoubanCardSkeleton key={index} />)

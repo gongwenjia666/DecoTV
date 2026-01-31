@@ -2,24 +2,74 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
-import { getAuthInfoFromCookie } from '@/lib/auth';
+import { verifyApiAuth } from '@/lib/auth';
 import { getConfig, getLocalModeConfig } from '@/lib/config';
 import { db } from '@/lib/db';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
-  const storageType = process.env.NEXT_PUBLIC_STORAGE_TYPE || 'localstorage';
-  const isLocalMode = storageType === 'localstorage';
+  // 🔐 使用统一认证函数，正确处理 localstorage 和数据库模式的差异
+  const authResult = verifyApiAuth(request);
 
   try {
     const body = await request.json();
 
-    const authInfo = getAuthInfoFromCookie(request);
-    if (!authInfo || !authInfo.username) {
+    // 本地模式（无数据库）：跳过认证，返回成功
+    if (authResult.isLocalMode) {
+      const {
+        SiteName,
+        Announcement,
+        SearchDownstreamMaxPage,
+        SiteInterfaceCacheTime,
+        DoubanProxyType,
+        DoubanProxy,
+        DoubanImageProxyType,
+        DoubanImageProxy,
+        DisableYellowFilter,
+        FluidSearch,
+      } = body as {
+        SiteName: string;
+        Announcement: string;
+        SearchDownstreamMaxPage: number;
+        SiteInterfaceCacheTime: number;
+        DoubanProxyType: string;
+        DoubanProxy: string;
+        DoubanImageProxyType: string;
+        DoubanImageProxy: string;
+        DisableYellowFilter: boolean;
+        FluidSearch: boolean;
+      };
+
+      const localConfig = getLocalModeConfig();
+      localConfig.SiteConfig = {
+        SiteName,
+        Announcement,
+        SearchDownstreamMaxPage,
+        SiteInterfaceCacheTime,
+        DoubanProxyType,
+        DoubanProxy,
+        DoubanImageProxyType,
+        DoubanImageProxy,
+        DisableYellowFilter,
+        FluidSearch,
+      };
+      return NextResponse.json({
+        message: '站点配置更新成功（本地模式）',
+        storageMode: 'local',
+      });
+    }
+
+    // 认证失败
+    if (!authResult.isValid) {
+      console.log('[admin/site] 认证失败:', {
+        hasAuth: !!request.cookies.get('auth'),
+        isLocalMode: authResult.isLocalMode,
+      });
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-    const username = authInfo.username;
+
+    const username = authResult.username;
 
     const {
       SiteName,
@@ -59,28 +109,6 @@ export async function POST(request: NextRequest) {
       typeof FluidSearch !== 'boolean'
     ) {
       return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
-    }
-
-    // 本地模式：返回成功但不保存到数据库（由前端保存到 localStorage）
-    if (isLocalMode) {
-      const localConfig = getLocalModeConfig();
-      localConfig.SiteConfig = {
-        SiteName,
-        Announcement,
-        SearchDownstreamMaxPage,
-        SiteInterfaceCacheTime,
-        DoubanProxyType,
-        DoubanProxy,
-        DoubanImageProxyType,
-        DoubanImageProxy,
-        DisableYellowFilter,
-        FluidSearch,
-      };
-      return NextResponse.json({
-        message: '站点配置更新成功（本地模式）',
-        Config: localConfig,
-        storageMode: 'local',
-      });
     }
 
     const adminConfig = await getConfig();
